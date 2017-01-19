@@ -1,0 +1,404 @@
+#!/usr/bin/env bash
+#
+#          name : wordpress.vim-generator
+#   description : a syntax file generator for wordpress.vim
+#    repository : https://github.com/joseluis/wordpress.vim-generator
+#        author : José Luis Cruz <joseluis@andamira.net> © 2016-2017
+#       license : MIT
+#
+# shellcheck disable=SC2034
+__WORDPRESS_VIM_GENERATOR_VERSION=0.1.0
+
+
+#-------------------------------------------------------------------------------
+# ::main
+#
+#   Main function.
+#
+# > $@ : all the arguments passed to the script
+#
+wpvim-gen::main () {
+
+	## GLOBALS
+
+	WP_DIR="./wordpress/"
+	WP_INCLUDES="$WP_DIR/wp-includes/"
+	OUT_DIR="."
+
+	ORIG_WORDPRESS_VIM="wordpress.vim" # to compare with
+
+
+	# shellcheck disable=SC2016
+	WP_VERSION="$(grep '^$wp_version' ${WP_INCLUDES}version.php | cut -d"'" -f2)"
+
+	NEW_WORDPRESS_VIM="$OUT_DIR/new-wordpress-$WP_VERSION.vim"
+
+	# CACHE
+	DEPRECATED_FUNCTIONS=""
+
+
+	## MAIN LOGIC
+
+	# NOTE: Uncomment next line to just print the statistics
+	# wpvim-gen::statistics ; exit
+
+	wpvim-gen::setup
+	wpvim-gen::header
+	wpvim-gen::parse
+	wpvim-gen::syntax-write
+	wpvim-gen::deprecated
+	wpvim-gen::footer
+
+	wpvim-gen::statistics
+
+} # ::main
+
+
+#-------------------------------------------------------------------------------
+# ::syntax-write
+#
+#   Writes a string into the syntax file.
+#
+# > $1 : The string to write
+#
+# shellcheck disable=SC2059
+wpvim-gen::syntax-write() { printf "$1\n" >> "$NEW_WORDPRESS_VIM"; }
+
+
+#-------------------------------------------------------------------------------
+# ::setup
+#
+#   Sets up the output directory and syntax file.
+#
+wpvim-gen::setup() {
+
+	mkdir -p -- "$OUT_DIR"
+
+	echo "" > "$NEW_WORDPRESS_VIM"
+
+} # ::setup
+
+
+#-------------------------------------------------------------------------------
+# ::header
+#
+#   Writes the syntax file header.
+#
+#
+wpvim-gen::header() {
+
+	wpvim-gen::syntax-write "if exists('b:current_syntax') && b:current_syntax == 'php.wordpress'
+  finish
+elseif !exists('b:wordpress_buffer')
+  finish
+elseif exists('g:wordpress_vim_php_syntax_highlight') && !g:wordpress_vim_php_syntax_highlight
+  finish
+end
+"
+
+} # ::header
+
+
+#-------------------------------------------------------------------------------
+# ::parse
+#
+#   Parses functions and classes, and writes them to the syntax file.
+#
+wpvim-gen::parse() {
+
+	# Get a list of WordPress files to parse
+	FILE_LIST=$(find $WP_INCLUDES | grep php$)
+
+
+	# PARSE FUNCTIONS
+	# ---------------
+
+	wpvim-gen::syntax-write '" --- Functions ---'
+
+	for FILE in $FILE_LIST; do
+
+		FILENAME=${FILE#$WP_INCLUDES}
+
+		# CLEAN THE LIST OF FUNCTIONS
+		#
+		# 1 - get the lines with: functions, @deprecated and @access private and protected
+		# 2 - clean the lines with tags
+		# 3 - clean the lines with functions
+		#
+		FUNCTIONS=$( grep -E \
+			'^function|^\ \*\ @deprecated|^\ \*\ @access\ private|^\ \*\ @access\ protected' \
+				"$FILE" \
+			| sed 's/^\ \*\ \(@[a-zA-Z]*\).*$/\1/' \
+			| sed 's/^function\ \([a-zA-Z_][a-zA-Z_0-9]*\).*$/\1/' \
+		)
+
+	#	echo "$FUNCTIONS" > 1_clean.txt # DEBUG_TEMP
+
+		# REMOVE PRIVATE AND PROTECTED FUNCTIONS
+		#
+		# 1 - join @deprecated and @access tags in 1 line
+		# 2 - remove private and protected functions
+		#
+		FUNCTIONS=$(echo "$FUNCTIONS" \
+			| sed '$!N;s/\(@.*\)\n@/\1@/;P;D' \
+			| sed -e '/^@.*access/,+1d' \
+		)
+
+	#	echo "$FUNCTIONS" > 2_remove_private.txt # DEBUG_TEMP
+
+		# FILTER DEPRECATED FUNCTIONS
+		DEPRECATED_FUNCTIONS_IN_FILE=$(echo "$FUNCTIONS" \
+			| grep -A1 @deprecated | grep -v @deprecated \
+		)
+
+	#	echo "$DEPRECATED_FUNCTIONS_IN_FILE" > 3_deprecated_in_file.txt # DEBUG_TEMP
+
+		# FILTER ACTIVE FUNCTIONS
+		FUNCTIONS=$(echo "$FUNCTIONS" \
+			| sed '/^@deprecated/,+1d'
+		)
+
+	#	echo "$FUNCTIONS" > 4_filter.txt # DEBUG_TEMP
+
+		if [ -n "$FUNCTIONS" ]; then
+
+			NUM_FUNCTIONS=$(echo "$FUNCTIONS" | wc -l)
+
+			echo "$NUM_FUNCTIONS functions in $FILENAME"
+
+			# Write the functions
+			wpvim-gen::syntax-write "\n\" $FILENAME"
+
+			ifs="$IFS"; IFS=$'\n'
+			for FUNCTION in $FUNCTIONS; do
+				wpvim-gen::syntax-write "syn keyword wpFunction $FUNCTION contained"
+			done
+			IFS="$ifs"
+
+			FUNCTIONS=''
+		fi
+
+		# STORE DEPRECATED FUNCTIONS
+		if [ -n "$DEPRECATED_FUNCTIONS_IN_FILE" ]; then
+			NUM_DEPRECATED_FUNCTIONS=$(echo "$DEPRECATED_FUNCTIONS_IN_FILE" | wc -l)
+			echo "  + $NUM_DEPRECATED_FUNCTIONS deprecated"
+
+			# Add the file header
+			DEPRECATED_FUNCTIONS="$DEPRECATED_FUNCTIONS"$'\n" '$FILENAME
+
+			# Add the deprecated function
+			ifs="$IFS"; IFS=$'\n'
+			for DEPRECATED_FUNCTION in $DEPRECATED_FUNCTIONS_IN_FILE; do
+				DEPRECATED_FUNCTIONS="$DEPRECATED_FUNCTIONS"$'\n'"syn keyword wpDeprecated $DEPRECATED_FUNCTION contained"
+			done
+			IFS="$ifs"
+		fi
+	done
+
+
+	# PARSE CLASSES
+	# -------------
+
+	wpvim-gen::syntax-write '\n" --- Classes ---'
+
+	for FILE in $FILE_LIST; do
+
+		FILENAME=${FILE#$WP_INCLUDES}
+
+		# CLEAN THE LIST OF CLASSES
+		#
+		# 1 - get the lines with: class, @deprecated and @access private and protected
+		# 2 - clean the lines with classes
+		#
+		CLASSES=$(grep -E '^(final )?class' "$FILE" \
+			| sed 's/^\(final\ \)\?class\ \([a-zA-Z_0-9]*\).*$/\2/' \
+		)
+
+	#	echo "$CLASSES" > 5_classes.txt # DEBUG_TEMP
+
+		if [ -n "$CLASSES" ]; then
+			NUM_CLASSES=$(echo "$CLASSES" | wc -l)
+			echo "$NUM_CLASSES classes in $FILENAME"
+
+			# Write the classes
+			wpvim-gen::syntax-write "\n\" $FILENAME"
+
+			ifs="$IFS"; IFS=$'\n'
+			for CLASS in $CLASSES; do
+				wpvim-gen::syntax-write "syn keyword wpClass $CLASS contained"
+			done
+			IFS="$ifs"
+
+			CLASSES=''
+		fi
+	done
+
+} # ::parse
+
+
+#-------------------------------------------------------------------------------
+# ::deprecated
+#
+#   Writes the deprecated functions.
+#
+wpvim-gen::deprecated() {
+
+	wpvim-gen::syntax-write '" --- Deprecated Functions ---'
+	wpvim-gen::syntax-write "$DEPRECATED_FUNCTIONS"
+
+} # ::deprecated
+
+
+#-------------------------------------------------------------------------------
+# ::footer
+#
+#   Writes syntax file footer.
+#
+wpvim-gen::footer() {
+
+	wpvim-gen::syntax-write "
+
+\" Extend php.vim
+syn cluster phpClConst add=wpFunction,wpClass,wpDeprecated
+
+\" Constants
+syn match wpConstant \"\\\vWP_[A-Z_]+\"
+syn match wpConstant \"\\\vDB_[A-Z_]+\"
+syn match wpConstant \"\\\v[A-Z_]+_KEY\"
+syn match wpConstant \"\\\v[A-Z_]+_SALT\"
+
+syn cluster phpClConst add=wpConstant
+
+\" Highlighting
+hi def link wpFunction Function
+hi def link wpClass StorageClass
+hi def link wpDeprecated Error
+hi def link wpConstant Constant
+
+\" Done
+let b:current_syntax = 'php.wordpress'"
+
+} # ::footer
+
+
+#-------------------------------------------------------------------------------
+# ::statistics
+#
+#   Collects and prints the statistics.
+#
+wpvim-gen::statistics() {
+
+	## GET DATA
+
+	NEW_FUNCTIONS=$(grep '^syn keyword wpFunction' "$NEW_WORDPRESS_VIM" | cut -d' ' -f4 | sort )
+	NEW_FUNCTIONS_NUM=$(echo "$NEW_FUNCTIONS" | wc -l)
+
+	NEW_DEPRECATED=$(grep '^syn keyword wpDeprecated' "$NEW_WORDPRESS_VIM" | cut -d' ' -f4 | sort )
+	NEW_DEPRECATED_NUM=$(echo "$NEW_DEPRECATED" | wc -l)
+
+	NEW_CLASSES=$(grep '^syn keyword wpClass' "$NEW_WORDPRESS_VIM"| cut -d' ' -f4 | sort )
+	NEW_CLASSES_NUM=$(echo "$NEW_CLASSES" | wc -l)
+
+	# ---
+
+	OLD_FUNCTIONS=$(grep '^syn keyword wpFunction' "$ORIG_WORDPRESS_VIM" | cut -d' ' -f4 | sort)
+	OLD_FUNCTIONS_NUM=$(echo "$OLD_FUNCTIONS" | wc -l)
+
+	OLD_DEPRECATED=$(grep '^syn keyword wpDeprecated' "$ORIG_WORDPRESS_VIM" | cut -d' ' -f4 | sort)
+	OLD_DEPRECATED_NUM=$(echo "$OLD_DEPRECATED" | wc -l)
+
+	OLD_CLASSES=$(grep '^syn keyword wpClass' "$ORIG_WORDPRESS_VIM" | cut -d' ' -f4 | sort)
+	OLD_CLASSES_NUM=$(echo "$OLD_CLASSES" | wc -l)
+
+	# ---
+
+	DIFFERENT_FUNCTIONS_NUM=$(( NEW_FUNCTIONS_NUM - OLD_FUNCTIONS_NUM ))
+	DIFFERENT_DEPRECATED_NUM=$(( NEW_DEPRECATED_NUM - OLD_DEPRECATED_NUM ))
+	DIFFERENT_CLASSES_NUM=$(( NEW_CLASSES_NUM - OLD_CLASSES_NUM ))
+
+	# ---
+
+	REMOVED_FUNCTIONS=$(comm -23 <(echo "$OLD_FUNCTIONS") <(echo "$NEW_FUNCTIONS") )
+	REMOVED_FUNCTIONS_NUM=$(echo "$REMOVED_FUNCTIONS" | sed -e '/^$/d' | wc -l)
+	ADDED_FUNCTIONS=$(comm -13 <(echo "$OLD_FUNCTIONS") <(echo "$NEW_FUNCTIONS") )
+	ADDED_FUNCTIONS_NUM=$(echo "$ADDED_FUNCTIONS" | sed -e '/^$/d' | wc -l)
+
+	REMOVED_DEPRECATED=$(comm -23 <(echo "$OLD_DEPRECATED") <(echo "$NEW_DEPRECATED") )
+	REMOVED_DEPRECATED_NUM=$(echo "$REMOVED_DEPRECATED" | sed -e '/^$/d' | wc -l)
+	ADDED_DEPRECATED=$(comm -13 <(echo "$OLD_DEPRECATED") <(echo "$NEW_DEPRECATED") )
+	ADDED_DEPRECATED_NUM=$(echo "$ADDED_DEPRECATED" | sed -e '/^$/d' | wc -l)
+
+	REMOVED_CLASSES=$(comm -23 <(echo "$OLD_CLASSES") <(echo "$NEW_CLASSES") )
+	REMOVED_CLASSES_NUM=$(echo "$REMOVED_CLASSES" | sed -e '/^$/d' | wc -l)
+	ADDED_CLASSES=$(comm -13 <(echo "$OLD_CLASSES") <(echo "$NEW_CLASSES") )
+	ADDED_CLASSES_NUM=$(echo "$ADDED_CLASSES" | sed -e '/^$/d' | wc -l)
+
+	# DEBUG_TEMP Another way of calculating the differences
+#	DIFFERENT_FUNCTIONS_NUM2=$(( ADDED_FUNCTIONS_NUM - REMOVED_FUNCTIONS_NUM ))
+#	DIFFERENT_DEPRECATED_NUM2=$(( ADDED_DEPRECATED_NUM - REMOVED_DEPRECATED_NUM ))
+#	DIFFERENT_CLASSES_NUM2=$(( ADDED_CLASSES_NUM - REMOVED_CLASSES_NUM ))
+
+
+	## PRINT STATISTICS
+
+	echo
+	echo "# List of removals/additions"
+	echo "# =========================="
+	echo
+	echo "# -------------------------------------------------------------------"
+	echo "# Removed functions:"
+	echo "# -------------------------------------------------------------------"
+	# shellcheck disable=SC2086
+	echo $REMOVED_FUNCTIONS
+	echo
+	echo "# -------------------------------------------------------------------"
+	echo "# Added functions:"
+	echo "# -------------------------------------------------------------------"
+	# shellcheck disable=SC2086
+	echo $ADDED_FUNCTIONS
+	echo
+	echo "# -------------------------------------------------------------------"
+	echo "# Removed deprecated functions:"
+	echo "# --------------------------------------------------------------------"
+	# shellcheck disable=SC2086
+	echo $REMOVED_DEPRECATED
+	echo
+	echo "# -------------------------------------------------------------------"
+	echo "# Added deprecated functions:"
+	echo "# -------------------------------------------------"
+	# shellcheck disable=SC2086
+	echo $ADDED_DEPRECATED
+	echo
+	echo "# -------------------------------------------------------------------"
+	echo "# Removed classes:"
+	echo "# -------------------------------------------------------------------"
+	# shellcheck disable=SC2086
+	echo $REMOVED_CLASSES
+	echo
+	echo "# -------------------------------------------------------------------"
+	echo "# Added classes:"
+	echo "# -------------------------------------------------------------------"
+	# shellcheck disable=SC2086
+	echo $ADDED_CLASSES
+	echo
+	echo
+	echo "# =================="
+	echo "# Summary statistics"
+	echo "# =================="
+	echo
+	echo "In the original file '$ORIG_WORDPRESS_VIM':"
+	echo -e "\tFunctions: $OLD_FUNCTIONS_NUM\tDeprecated: $OLD_DEPRECATED_NUM\tClasses: $OLD_CLASSES_NUM"
+	echo
+	echo "In the new file '$NEW_WORDPRESS_VIM':"
+	echo -e "\tFunctions: $NEW_FUNCTIONS_NUM\tDeprecated: $NEW_DEPRECATED_NUM\tClasses: $NEW_CLASSES_NUM"
+	echo
+	echo -e "ADDED:  \tFunctions: $ADDED_FUNCTIONS_NUM\tDeprecated: $ADDED_DEPRECATED_NUM\tClasses: $ADDED_CLASSES_NUM"
+	echo -e "REMOVED:\tFunctions: $REMOVED_FUNCTIONS_NUM\tDeprecated: $REMOVED_DEPRECATED_NUM\tClasses: $REMOVED_CLASSES_NUM"
+	echo
+	echo -e "DIFFERENCE:\tFunctions: $DIFFERENT_FUNCTIONS_NUM\tDeprecated: $DIFFERENT_DEPRECATED_NUM\tClasses: $DIFFERENT_CLASSES_NUM"
+	# echo -e "DIFFERENCE2: \tFunctions: $DIFFERENT_FUNCTIONS_NUM2\tDeprecated: $DIFFERENT_DEPRECATED_NUM2\tClasses: $DIFFERENT_CLASSES_NUM2" # DEBUG_TEMP
+
+} # ::statistics
+
+
+[[ $0 == "${BASH_SOURCE[0]}" ]] && wpvim-gen::main "$@"
